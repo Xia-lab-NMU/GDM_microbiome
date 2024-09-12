@@ -1,0 +1,120 @@
+# Metanemic data analysis
+## 1.Software and database installation
+db=~/db
+mkdir -p ${db} && cd ${db}
+soft=~/miniconda3
+## 2.activate created environment 
+conda activate meta2
+## To upgrade your pangenome database:
+humann_databases --download utility_mapping full ${db}/humann3
+humann_databases --download chocophlan full ${db}/humann3
+humann_databases --download uniref uniref90_diamond ${db}/humann3
+    
+#download the EC-filtered UniRef90 database (2.8GB)
+humann_databases --download uniref uniref90_ec_filtered_diamond ${db}/humann3
+    
+#download the full UniRef50 database (6.43GB)
+humann_databases --download uniref uniref50_diamond ${db}/humann3
+    
+#download the EC-filtered UniRef50 database (0.26GB)
+humann_databases --download uniref uniref50_ec_filtered_diamond ${db}/humann3
+
+humann_config --print
+
+humann_config --update run_modes threads 5
+humann_config --update database_folders utility_mapping ${db}/humann3/utility_mapping
+humann_config --update database_folders nucleotide ${db}/humann3/chocophlan
+humann_config --update database_folders protein ${db}/humann3/uniref
+
+## 2.Quality control and removal of host genes
+
+time parallel -j 15 --xapply \
+"kneaddata -i seq/{1}_R1_001.fastq.gz \
+      -i seq/{1}_R2_001.fastq.gz \
+      -o temp/qc -v -t 4 --remove-intermediate-output \
+      --trimmomatic ${soft}/envs/meta/share/trimmomatic/ \
+      --trimmomatic-options 'ILLUMINACLIP:TruSeq3-PE.fa:2:40:15 SLIDINGWINDOW:4:20 MINLEN:50' \
+      --bowtie2-options '--very-sensitive --dovetail' \
+      -db ${db}/kneaddata/human_genome/Homo_sapiens" \
+::: `tail -n+2 result/metadata.txt|cut -f1`
+
+#Deletion of large files
+rm -rf temp/qc/*contam* temp/qc/*unmatched* 
+
+kneaddata_read_count_table \
+--input temp/qc \
+--output temp/kneaddata.txt
+
+for i in `tail -n+2 result/metadata_stage2.txt|cut -f2`;do
+cat temp/qc/${i}*.R1.raw_kneaddata_paired_?.fastq > temp/concat/${i}_all.fq;
+done
+
+## 3. Taxonomy and functional pathway annotation using Humann3
+
+#taxonomy annotation
+time parallel -j 2 \
+'humann --input temp/concat/{}_all.fq  \
+      --output temp/humann3/ --threads 10 --metaphlan-options="--index mpa_vJan21_CHOCOPhlAnSGB_202103"' \
+::: `tail -n+2 result/metadata.txt|cut -f1` > temp/log
+
+# Combine results
+merge_metaphlan_tables.py \
+temp/humann3/*_metaphlan_bugs_list.tsv | \
+sed 's/_metaphlan_bugs_list//g' \
+> result/metaphlan3/taxonomy.tsv
+
+head -n3 result/metaphlan3/taxonomy.tsv
+
+#Functional pathway analysis
+humann_join_tables \
+--input temp/humann3 \
+--file_name pathabundance \
+--output result/humann3/pathabundance.tsv
+
+#Convert to relative abundance
+
+humann_renorm_table \
+--input result/humann3/pathabundance.tsv \
+--units relab \
+--output result/humann3/pathabundance_relab.tsv
+head -n5 result/humann3/pathabundance_relab.tsv
+
+#Hierarchical results: table of functions and corresponding species (stratified) and table of functional compositions (unstratified)
+humann_split_stratified_table \
+--input result/humann3/pathabundance_relab.tsv \
+--output result/humann3/ 
+
+#Convert to KEGG annotations
+for i in `tail -n+2 result/metadata.txt|cut -f1`;do
+humann_regroup_table \
+-i temp/humann3/${i}_all_genefamilies.tsv \
+-g uniref90_ko \
+-o temp/humann3/${i}_ko.tsv
+done
+
+# combine results
+humann_join_tables \
+--input temp/humann3/ \
+--file_name ko \
+--output result/humann3/ko.tsv
+sed -i '1s/_Abundance-RPKs//g' result/humann3/ko.tsv
+
+#Convert to relative abundance
+humann_renorm_table \
+--input result/humann3/ko.tsv \
+--units relab \
+--output result/humann3/ko_relab.tsv
+head -n5 result/humann3/ko_relab.tsv
+
+#Hierarchical results: table of functions and corresponding species (stratified) and table of functional compositions (unstratified)
+humann_split_stratified_table \
+--input result/humann3/ko_relab.tsv \
+--output result/humann3/ 
+
+#ko2pathway
+conda activate py3
+python /home/sdb1/yx/meta2/db/script/summarizeAbundance.py \
+-i result/humann3/ko.tsv \
+-m db/kegg/KO_path.list \
+-c '2' -s ',' -n raw \
+-o result/humann3/ko
